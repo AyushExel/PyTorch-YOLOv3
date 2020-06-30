@@ -21,19 +21,32 @@ from torchvision import datasets
 from torchvision import transforms
 from torch.autograd import Variable
 import torch.optim as optim
+import wandb
+import artifact_utils
+'''
+IGNORE WARNINGS
+'''
+import warnings
+warnings.filterwarnings("ignore")
+'''
+Create Artifacts and setup logging
+'''
+run = artifact_utils.init_new_run('demo_model')
+artifact_utils.create_dataset_artifact('data/custom/images','demo-dataset',run)
+model_ckpt_name = ''
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=100, help="number of epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="size of each image batch")
+    parser.add_argument("--batch_size", type=int, default=4, help="size of each image batch")
     parser.add_argument("--gradient_accumulations", type=int, default=2, help="number of gradient accums before step")
-    parser.add_argument("--model_def", type=str, default="config/yolov3.cfg", help="path to model definition file")
-    parser.add_argument("--data_config", type=str, default="config/coco.data", help="path to data config file")
+    parser.add_argument("--model_def", type=str, default="config/yolov3-tiny.cfg", help="path to model definition file")
+    parser.add_argument("--data_config", type=str, default="config/custom.data", help="path to data config file")
     parser.add_argument("--pretrained_weights", type=str, help="if specified starts from checkpoint model")
     parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
     parser.add_argument("--img_size", type=int, default=416, help="size of each image dimension")
     parser.add_argument("--checkpoint_interval", type=int, default=1, help="interval between saving model weights")
-    parser.add_argument("--evaluation_interval", type=int, default=1, help="interval evaluations on validation set")
+    parser.add_argument("--evaluation_interval", type=int, default=5, help="interval evaluations on validation set")
     parser.add_argument("--compute_map", default=False, help="if True computes mAP every tenth batch")
     parser.add_argument("--multiscale_training", default=True, help="allow for multi-scale training")
     opt = parser.parse_args()
@@ -74,7 +87,7 @@ if __name__ == "__main__":
         collate_fn=dataset.collate_fn,
     )
 
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.Adam(model.parameters(),0.001)
 
     metrics = [
         "grid_size",
@@ -92,8 +105,9 @@ if __name__ == "__main__":
         "conf_obj",
         "conf_noobj",
     ]
-
+    wandb.watch(model)
     for epoch in range(opt.epochs):
+        torch.cuda.empty_cache()
         model.train()
         start_time = time.time()
         for batch_i, (_, imgs, targets) in enumerate(dataloader):
@@ -137,7 +151,8 @@ if __name__ == "__main__":
 
             log_str += AsciiTable(metric_table).table
             log_str += f"\nTotal loss {loss.item()}"
-
+            # LOG TRAIN_LOSS
+            wandb.log({"train_loss":loss.item()})
             # Determine approximate time left for epoch
             epoch_batches_left = len(dataloader) - (batch_i + 1)
             time_left = datetime.timedelta(seconds=epoch_batches_left * (time.time() - start_time) / (batch_i + 1))
@@ -147,7 +162,7 @@ if __name__ == "__main__":
 
             model.seen += imgs.size(0)
 
-        if epoch % opt.evaluation_interval == 0:
+        if (epoch+1) % opt.evaluation_interval == 0:
             print("\n---- Evaluating Model ----")
             # Evaluate the model on the validation set
             precision, recall, AP, f1, ap_class = evaluate(
@@ -166,13 +181,22 @@ if __name__ == "__main__":
                 ("val_f1", f1.mean()),
             ]
             logger.list_of_scalars_summary(evaluation_metrics, epoch)
-
+            print("val_precision", precision.mean() )
+            #LOG EVAL METRICS
+            wandb.log({"val_precision": precision.mean(),
+                         "val_recall": recall.mean()  ,
+                         "val_mAP": AP.mean() ,
+                         "val_f1": f1.mean() })
             # Print class APs and mAP
             ap_table = [["Index", "Class name", "AP"]]
             for i, c in enumerate(ap_class):
                 ap_table += [[c, class_names[c], "%.5f" % AP[i]]]
             print(AsciiTable(ap_table).table)
             print(f"---- mAP {AP.mean()}")
-
+        
         if epoch % opt.checkpoint_interval == 0:
             torch.save(model.state_dict(), f"checkpoints/yolov3_ckpt_%d.pth" % epoch)
+            model_ckpt_name = f"checkpoints/yolov3_ckpt_%d.pth" % epoch
+
+artifact_utils.create_model_artifact(model_ckpt_name,run)
+
